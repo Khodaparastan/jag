@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Enable extended globbing behavior for empty matches
+shopt -s nullglob
+
+# Collect files matching in-<number>.json (e.g., in-1.json, in-10.json)
+files=(in-[0-9]*.json)
+
+if ((${#files[@]} == 0)); then
+  echo "No input files matching 'in-[0-9]*.json' found" >&2
+  exit 1
+fi
+
+# Usage:
+#   jag [output.json] \
+#     [--root jq_path] \
+#     [--select field1 field2 ...] \
+#     [--filter field=true field2=false ...] \
+#     [--agg field=op field2=op2 ...] \
+#     [--hist field1 field2 ...] \
+#     [--output merged|agg|both]
+#
+# Examples:
+#   jag                                        # all original fields from .result, writes merged.json
+#   jag all.json                               # all original fields from .result, writes all.json
+#   jag all.json --root .result                # explicit default
+#   jag all.json --root .data.items            # read from .data.items instead of .result
+#   jag all.json --select amount fee created_at --
+#   jag all.json --filter is_success=true is_verified=true
+#   jag all.json --select amount fee -- --filter is_success=true
+#   jag all.json --agg amount=sum fee=sum --output agg
+#   jag all.json --hist bank_code --output agg
+
+output=${1:-merged.json}
+shift || true
+
+# Default jq path where records are located
+root_path='.result'
+
+# Arrays for projection fields, boolean filters, aggregations, and histograms
+select_fields=()
+filter_exprs=()
+agg_specs=()
+hist_fields=()
+
+# Output mode: merged (default), agg, or both
+output_mode="merged"
+
+# Parse remaining arguments
+mode="select"  # "select" until we see --filter/--agg/--hist
+while (($# > 0)); do
+  case "$1" in
+    --root)
+      shift || true
+      if (($# == 0)); then
+        echo "--root requires a jq path argument (e.g. .result or .data.items)" >&2
+        exit 1
+      fi
+      root_path="$1"
+      ;;
+    --select)
+      mode="select"
+      ;;
+    --filter)
+      mode="filter"
+      ;;
+    --agg)
+      mode="agg"
+      ;;
+    --hist)
+      mode="hist"
+      ;;
+    --output)
+      shift || true
+      if (($# == 0)); then
+        echo "--output requires one of: merged, agg, both" >&2
+        exit 1
+      fi
+      output_mode="$1"
+      if [[ "$output_mode" != "merged" && "$output_mode" != "agg" && "$output_mode" != "both" ]]; then
+        echo "Invalid --output '$output_mode'. Expected merged, agg, or both" >&2
+        exit 1
+      fi
+      ;;
+    --)
+      # Just a separator; do nothing
+      ;;
+    *)
+      case "$mode" in
+        select)
+          select_fields+=("$1")
+          ;;
+        filter)
+          # Expect form field=true or field=false
+          if [[ "$1" == *=true || "$1" == *=false ]]; then
+            filter_exprs+=("$1")
+          else
+            echo "Invalid filter '$1'. Expected form field=true or field=false" >&2
+            exit 1
+          fi
+          ;;
+        agg)
+          # Expect form field=op, where op is one of sum,count,min,max,avg,true_count,false_count,true_rate,false_rate
+          if [[ "$1" == *=* ]]; then
+            agg_specs+=("$1")
+          else
+            echo "Invalid aggregator '$1'. Expected form field=op (e.g. amount=sum)" >&2
+            exit 1
+          fi
+          ;;
+        hist)
+          # Histogram fields (e.g. bank_code)
+          hist_fields+=("$1")
+          ;;
+      esac
+      ;;
+  esac
+  shift || true
+done
+
+# Build jq filter for projection
+if ((${#select_fields[@]} > 0)); then
+  # Build a jq object like: {amount, fee, created_at}
+  jq_projection='map({'
+  first=1
+  for f in "${select_fields[@]}"; do
+    if (( first )); then
+      jq_projection+="${f}: .${f}"
+      first=0
+    else
+      jq_projection+=", ${f}: .${f}"
+    fi
+  done
+  jq_projection+='})'
+else
+  # No field filter: keep records as-is
+  jq_projection='.'
+fi
+
+# Build jq filter for boolean conditions
+jq_bool_filter='.'
+if ((${#filter_exprs[@]} > 0)); then
+  jq_bool_filter='map(select('
+  first=1
+  for cond in "${filter_exprs[@]}"; do
+    field_name="${cond%%=*}"
+    value="${cond##*=}"
+    jq_value="true"
+    if [[ "$value" == "false" ]]; then
+      jq_value="false"
+    fi
+    if (( first )); then
+      jq_bool_filter+=".${field_name} == ${jq_value}"
+      first=0
+    else
+      jq_bool_filter+=" and .${field_name} == ${jq_value}"
+    fi
+  done
+  jq_bool_filter+='))'
+fi
+
+# Base data pipeline (before projection): merge roots and apply boolean filters
+base_pipeline="map(${root_path}) | add"
+filtered_pipeline="${base_pipeline} | ${jq_bool_filter}"
+
+# Build jq object for aggregations and histograms
+jq_aggs='{}'
+if ((${#agg_specs[@]} > 0 || ${#hist_fields[@]} > 0)); then
+  jq_aggs='{'  # we'll build something like {amount_sum: (...), fee_min: (...), bank_code_counts: {...}}
+  first=1
+
+  # Numeric / boolean aggregations
+  for spec in "${agg_specs[@]}"; do
+    field_name="${spec%%=*}"
+    op="${spec##*=}"
+    case "$op" in
+      sum)
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | add)"
+        agg_key="${field_name}_sum"
+        ;;
+      count)
+        agg_expr="(${filtered_pipeline} | length)"
+        agg_key="${field_name}_count"
+        ;;
+      min)
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | min)"
+        agg_key="${field_name}_min"
+        ;;
+      max)
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | max)"
+        agg_key="${field_name}_max"
+        ;;
+      avg)
+        agg_expr="(${filtered_pipeline} | (if length == 0 then null else (map(.${field_name}) | add / length) end))"
+        agg_key="${field_name}_avg"
+        ;;
+      true_count)
+        agg_expr="(${filtered_pipeline} | map(select(.${field_name} == true)) | length)"
+        agg_key="${field_name}_true_count"
+        ;;
+      false_count)
+        agg_expr="(${filtered_pipeline} | map(select(.${field_name} == false)) | length)"
+        agg_key="${field_name}_false_count"
+        ;;
+      true_rate)
+        agg_expr="(${filtered_pipeline} | (map(select(.${field_name} == true)) | length) as \$n | length as \$d | if \$d == 0 then null else (\$n / \$d) end)"
+        agg_key="${field_name}_true_rate"
+        ;;
+      false_rate)
+        agg_expr="(${filtered_pipeline} | (map(select(.${field_name} == false)) | length) as \$n | length as \$d | if \$d == 0 then null else (\$n / \$d) end)"
+        agg_key="${field_name}_false_rate"
+        ;;
+      *)
+        echo "Unsupported aggregator op '$op' for '$field_name'. Supported: sum,count,min,max,avg,true_count,false_count,true_rate,false_rate" >&2
+        exit 1
+        ;;
+    esac
+    if (( first )); then
+      jq_aggs+="\"${agg_key}\": ${agg_expr}"
+      first=0
+    else
+      jq_aggs+=", \"${agg_key}\": ${agg_expr}"
+    fi
+  done
+
+  # Histograms for specified fields
+  for field_name in "${hist_fields[@]}"; do
+    hist_expr="(${filtered_pipeline} | group_by(.${field_name}) | map({(.[0].${field_name}): length}) | add)"
+    agg_key="${field_name}_counts"
+    if (( first )); then
+      jq_aggs+="\"${agg_key}\": ${hist_expr}"
+      first=0
+    else
+      jq_aggs+="; \"${agg_key}\": ${hist_expr}"
+    fi
+  done
+
+  jq_aggs+='}'
+fi
+
+# Build merged data expression
+jq_merged_data="(${filtered_pipeline} | ${jq_projection})"
+
+# Final jq program: choose output structure based on output_mode
+case "$output_mode" in
+  merged)
+    jq_filter="{result: ${jq_merged_data}}"
+    ;;
+  agg)
+    jq_filter="{aggregates: ${jq_aggs}}"
+    ;;
+  both)
+    jq_filter="{result: ${jq_merged_data}, aggregates: ${jq_aggs}}"
+    ;;
+ esac
+
+# Merge and optionally project selected fields / apply boolean filters / aggregations
+jq -s "$jq_filter" "${files[@]}" > "$output"
+
+echo "Merged ${#files[@]} files into $output"
