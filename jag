@@ -1,62 +1,235 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ============================================================================
+# JSON Merge & Aggregation Tool
+# ============================================================================
+# Version: 2.0.0
+# Description: Merge, filter, project, and aggregate multiple JSON files
+# ============================================================================
+
 # Enable extended globbing behavior for empty matches
 shopt -s nullglob
 
-# Collect files matching in-<number>.json (e.g., in-1.json, in-10.json)
+# Color output for better UX (if terminal supports it)
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  BLUE='\033[0;34m'
+  NC='\033[0m' # No Color
+else
+  RED=''
+  GREEN=''
+  YELLOW=''
+  BLUE=''
+  NC=''
+fi
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+log_info() {
+  echo -e "${BLUE}[INFO]${NC} $*" >&2
+}
+
+log_success() {
+  echo -e "${GREEN}[SUCCESS]${NC} $*" >&2
+}
+
+log_warning() {
+  echo -e "${YELLOW}[WARNING]${NC} $*" >&2
+}
+
+log_error() {
+  echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+show_help() {
+  cat << 'EOF'
+JSON Merge & Aggregation Tool v2.0.0
+
+USAGE:
+  jag [output.json] [OPTIONS]
+
+OPTIONS:
+  --root PATH              jq path where records are located (default: .result)
+  --select FIELD...        Select specific fields to include in output
+  --filter EXPR...         Filter records by boolean conditions (field=true|false)
+  --agg SPEC...           Aggregate fields (field=op where op is sum|count|min|max|avg|
+                          true_count|false_count|true_rate|false_rate|median|stddev)
+  --hist FIELD...         Generate histogram (frequency count) for fields
+  --output MODE           Output mode: merged|agg|both (default: merged)
+  --sort FIELD            Sort merged results by field (ascending)
+  --sort-desc FIELD       Sort merged results by field (descending)
+  --limit N               Limit merged results to N records
+  --skip N                Skip first N records in merged results
+  --null-handling MODE    How to handle nulls: keep|remove|zero (default: keep)
+  --streaming             Use streaming mode for large files (lower memory usage)
+  --pretty                Pretty-print output JSON
+  --validate              Validate input files before processing
+  --dry-run               Show generated jq filter without executing
+  --verbose               Enable verbose logging
+  --help, -h              Show this help message
+
+EXAMPLES:
+  # Basic merge with all fields
+  jag output.json
+
+  # Select specific fields
+  jag output.json --select id amount status created_at
+
+  # Filter by boolean conditions
+  jag output.json --filter is_active=true is_verified=true
+
+  # Combine selection, filtering, and sorting
+  jag output.json --select amount fee --filter is_success=true --sort amount
+
+  # Aggregations only
+  jag stats.json --agg amount=sum fee=avg amount=count --output agg
+
+  # Histogram of categorical fields
+  jag stats.json --hist status bank_code --output agg
+
+  # Everything combined
+  jag full.json \
+    --root .data.items \
+    --select id amount status \
+    --filter is_active=true \
+    --agg amount=sum amount=avg amount=count \
+    --hist status \
+    --sort-desc amount \
+    --limit 100 \
+    --output both \
+    --pretty
+
+  # Use different root path
+  jag output.json --root .data.transactions
+
+  # Streaming mode for large files
+  jag large.json --streaming --select id amount
+
+  # Validate inputs before processing
+  jag output.json --validate --verbose
+
+SUPPORTED AGGREGATION OPERATIONS:
+  sum          Sum of numeric values
+  count        Count of records
+  min          Minimum value
+  max          Maximum value
+  avg          Average (mean) value
+  median       Median value
+  stddev       Standard deviation
+  true_count   Count of true boolean values
+  false_count  Count of false boolean values
+  true_rate    Percentage of true values (0.0 to 1.0)
+  false_rate   Percentage of false values (0.0 to 1.0)
+
+NULL HANDLING MODES:
+  keep         Keep null values as-is (default)
+  remove       Remove records with null values in selected fields
+  zero         Replace null numeric values with 0, null booleans with false
+
+INPUT FILES:
+  Automatically detects files matching pattern: in-[0-9]*.json
+  Examples: in-1.json, in-2.json, in-10.json, in-100.json
+
+EOF
+}
+
+validate_json_file() {
+  local file="$1"
+  if ! jq empty "$file" 2>/dev/null; then
+    log_error "Invalid JSON in file: $file"
+    return 1
+  fi
+  return 0
+}
+
+validate_jq_path() {
+  local path="$1"
+  local file="$2"
+  if ! jq -e "$path" "$file" > /dev/null 2>&1; then
+    log_error "Invalid jq path '$path' for file: $file"
+    log_error "Available top-level keys: $(jq -r 'keys | join(", ")' "$file" 2>/dev/null || echo "none")"
+    return 1
+  fi
+  return 0
+}
+
+check_dependencies() {
+  local missing=()
+
+  if ! command -v jq &> /dev/null; then
+    missing+=("jq")
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Missing required dependencies: ${missing[*]}"
+    log_error "Please install: sudo apt-get install jq  # or brew install jq"
+    exit 1
+  fi
+
+  # Check jq version (need 1.5+)
+  local jq_version
+  jq_version=$(jq --version 2>&1 | grep -Eo '\d+\.\d+' | head -1)
+  if [[ -n "$jq_version" ]] && (( $(echo "$jq_version < 1.5" | bc -l 2>/dev/null || echo 0) )); then
+    log_warning "jq version $jq_version detected. Version 1.5+ recommended."
+  fi
+}
+
+# ============================================================================
+# Main Script
+# ============================================================================
+
+# Check dependencies first
+check_dependencies
+
+# Collect files matching in-<number>.json
 files=(in-[0-9]*.json)
 
 if ((${#files[@]} == 0)); then
-  echo "No input files matching 'in-[0-9]*.json' found" >&2
+  log_error "No input files matching 'in-[0-9]*.json' found in current directory"
+  log_info "Expected files like: in-1.json, in-2.json, etc."
   exit 1
 fi
 
-# Usage:
-#   jag [output.json] \
-#     [--root jq_path] \
-#     [--select field1 field2 ...] \
-#     [--filter field=true field2=false ...] \
-#     [--agg field=op field2=op2 ...] \
-#     [--hist field1 field2 ...] \
-#     [--output merged|agg|both]
-#
-# Examples:
-#   jag                                        # all original fields from .result, writes merged.json
-#   jag all.json                               # all original fields from .result, writes all.json
-#   jag all.json --root .result                # explicit default
-#   jag all.json --root .data.items            # read from .data.items instead of .result
-#   jag all.json --select amount fee created_at --
-#   jag all.json --filter is_success=true is_verified=true
-#   jag all.json --select amount fee -- --filter is_success=true
-#   jag all.json --agg amount=sum fee=sum --output agg
-#   jag all.json --hist bank_code --output agg
-
-output=${1:-merged.json}
+# Default values
+output="${1:-merged.json}"
+if [[ "$output" == "--help" ]] || [[ "$output" == "-h" ]]; then
+  show_help
+  exit 0
+fi
 shift || true
 
-# Default jq path where records are located
 root_path='.result'
-
-# Arrays for projection fields, boolean filters, aggregations, and histograms
 select_fields=()
 filter_exprs=()
 agg_specs=()
 hist_fields=()
-
-# Output mode: merged (default), agg, or both
 output_mode="merged"
+sort_field=""
+sort_order="asc"
+limit=""
+skip=""
+null_handling="keep"
+streaming=false
+pretty=false
+validate=false
+dry_run=false
+verbose=false
 
-# Parse remaining arguments
-mode="select"  # "select" until we see --filter/--agg/--hist
+# Parse arguments
+mode="select"
 while (($# > 0)); do
   case "$1" in
+    --help|-h)
+      show_help
+      exit 0
+      ;;
     --root)
-      shift || true
-      if (($# == 0)); then
-        echo "--root requires a jq path argument (e.g. .result or .data.items)" >&2
-        exit 1
-      fi
+      shift || { log_error "--root requires a jq path argument"; exit 1; }
       root_path="$1"
       ;;
     --select)
@@ -72,19 +245,65 @@ while (($# > 0)); do
       mode="hist"
       ;;
     --output)
-      shift || true
-      if (($# == 0)); then
-        echo "--output requires one of: merged, agg, both" >&2
-        exit 1
-      fi
+      shift || { log_error "--output requires an argument"; exit 1; }
       output_mode="$1"
       if [[ "$output_mode" != "merged" && "$output_mode" != "agg" && "$output_mode" != "both" ]]; then
-        echo "Invalid --output '$output_mode'. Expected merged, agg, or both" >&2
+        log_error "Invalid --output '$output_mode'. Expected: merged, agg, or both"
         exit 1
       fi
       ;;
+    --sort)
+      shift || { log_error "--sort requires a field name"; exit 1; }
+      sort_field="$1"
+      sort_order="asc"
+      ;;
+    --sort-desc)
+      shift || { log_error "--sort-desc requires a field name"; exit 1; }
+      sort_field="$1"
+      sort_order="desc"
+      ;;
+    --limit)
+      shift || { log_error "--limit requires a number"; exit 1; }
+      if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid --limit value '$1'. Expected positive integer"
+        exit 1
+      fi
+      limit="$1"
+      ;;
+    --skip)
+      shift || { log_error "--skip requires a number"; exit 1; }
+      if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid --skip value '$1'. Expected positive integer"
+        exit 1
+      fi
+      skip="$1"
+      ;;
+    --null-handling)
+      shift || { log_error "--null-handling requires an argument"; exit 1; }
+      null_handling="$1"
+      if [[ "$null_handling" != "keep" && "$null_handling" != "remove" && "$null_handling" != "zero" ]]; then
+        log_error "Invalid --null-handling '$null_handling'. Expected: keep, remove, or zero"
+        exit 1
+      fi
+      ;;
+    --streaming)
+      streaming=true
+      ;;
+    --pretty)
+      pretty=true
+      ;;
+    --validate)
+      validate=true
+      ;;
+    --dry-run)
+      dry_run=true
+      verbose=true
+      ;;
+    --verbose)
+      verbose=true
+      ;;
     --)
-      # Just a separator; do nothing
+      # Separator, do nothing
       ;;
     *)
       case "$mode" in
@@ -92,25 +311,30 @@ while (($# > 0)); do
           select_fields+=("$1")
           ;;
         filter)
-          # Expect form field=true or field=false
           if [[ "$1" == *=true || "$1" == *=false ]]; then
             filter_exprs+=("$1")
           else
-            echo "Invalid filter '$1'. Expected form field=true or field=false" >&2
+            log_error "Invalid filter '$1'. Expected format: field=true or field=false"
             exit 1
           fi
           ;;
         agg)
-          # Expect form field=op, where op is one of sum,count,min,max,avg,true_count,false_count,true_rate,false_rate
           if [[ "$1" == *=* ]]; then
+            field_name="${1%%=*}"
+            op="${1##*=}"
+            valid_ops="sum|count|min|max|avg|median|stddev|true_count|false_count|true_rate|false_rate"
+            if [[ ! "$op" =~ ^($valid_ops)$ ]]; then
+              log_error "Invalid aggregator op '$op' for field '$field_name'"
+              log_error "Supported ops: sum, count, min, max, avg, median, stddev, true_count, false_count, true_rate, false_rate"
+              exit 1
+            fi
             agg_specs+=("$1")
           else
-            echo "Invalid aggregator '$1'. Expected form field=op (e.g. amount=sum)" >&2
+            log_error "Invalid aggregator '$1'. Expected format: field=op (e.g., amount=sum)"
             exit 1
           fi
           ;;
         hist)
-          # Histogram fields (e.g. bank_code)
           hist_fields+=("$1")
           ;;
       esac
@@ -119,26 +343,74 @@ while (($# > 0)); do
   shift || true
 done
 
-# Build jq filter for projection
-if ((${#select_fields[@]} > 0)); then
-  # Build a jq object like: {amount, fee, created_at}
-  jq_projection='map({'
-  first=1
-  for f in "${select_fields[@]}"; do
-    if (( first )); then
-      jq_projection+="${f}: .${f}"
-      first=0
-    else
-      jq_projection+=", ${f}: .${f}"
+# Validation phase
+if [[ "$validate" == true ]]; then
+  log_info "Validating ${#files[@]} input files..."
+  validation_failed=false
+
+  for file in "${files[@]}"; do
+    if [[ "$verbose" == true ]]; then
+      log_info "Validating: $file"
+    fi
+
+    if ! validate_json_file "$file"; then
+      validation_failed=true
+      continue
+    fi
+
+    if ! validate_jq_path "$root_path" "$file"; then
+      validation_failed=true
+      continue
     fi
   done
-  jq_projection+='})'
-else
-  # No field filter: keep records as-is
-  jq_projection='.'
+
+  if [[ "$validation_failed" == true ]]; then
+    log_error "Validation failed. Please fix errors above."
+    exit 1
+  fi
+
+  log_success "All input files validated successfully"
 fi
 
-# Build jq filter for boolean conditions
+if [[ "$verbose" == true ]]; then
+  log_info "Processing ${#files[@]} files: ${files[*]}"
+  log_info "Root path: $root_path"
+  log_info "Output file: $output"
+  log_info "Output mode: $output_mode"
+  [[ ${#select_fields[@]} -gt 0 ]] && log_info "Selected fields: ${select_fields[*]}"
+  [[ ${#filter_exprs[@]} -gt 0 ]] && log_info "Filters: ${filter_exprs[*]}"
+  [[ ${#agg_specs[@]} -gt 0 ]] && log_info "Aggregations: ${agg_specs[*]}"
+  [[ ${#hist_fields[@]} -gt 0 ]] && log_info "Histograms: ${hist_fields[*]}"
+  [[ -n "$sort_field" ]] && log_info "Sort: $sort_field ($sort_order)"
+  [[ -n "$limit" ]] && log_info "Limit: $limit"
+  [[ -n "$skip" ]] && log_info "Skip: $skip"
+  log_info "Null handling: $null_handling"
+fi
+
+# ============================================================================
+# Build jq Filter Pipeline
+# ============================================================================
+
+# Base pipeline: merge root paths from all files
+base_pipeline="map(${root_path}) | add"
+
+# Apply null handling at record level
+null_filter='.'
+if [[ "$null_handling" == "remove" ]]; then
+  if ((${#select_fields[@]} > 0)); then
+    # Remove records where any selected field is null
+    null_conditions=()
+    for f in "${select_fields[@]}"; do
+      null_conditions+=(".${f} != null")
+    done
+    null_filter="map(select($(IFS=' and '; echo "${null_conditions[*]}")))"
+  fi
+elif [[ "$null_handling" == "zero" ]]; then
+  # This will be applied during projection
+  :
+fi
+
+# Apply boolean filters
 jq_bool_filter='.'
 if ((${#filter_exprs[@]} > 0)); then
   jq_bool_filter='map(select('
@@ -160,23 +432,68 @@ if ((${#filter_exprs[@]} > 0)); then
   jq_bool_filter+='))'
 fi
 
-# Base data pipeline (before projection): merge roots and apply boolean filters
-base_pipeline="map(${root_path}) | add"
-filtered_pipeline="${base_pipeline} | ${jq_bool_filter}"
+# Build filtered pipeline
+filtered_pipeline="${base_pipeline} | ${null_filter} | ${jq_bool_filter}"
 
-# Build jq object for aggregations and histograms
+# Build projection
+jq_projection='.'
+if ((${#select_fields[@]} > 0)); then
+  jq_projection='map({'
+  first=1
+  for f in "${select_fields[@]}"; do
+    if (( first )); then
+      first=0
+    else
+      jq_projection+=', '
+    fi
+
+    # Handle null replacement based on null_handling mode
+    if [[ "$null_handling" == "zero" ]]; then
+      jq_projection+="${f}: (.${f} // 0)"
+    else
+      jq_projection+="${f}: .${f}"
+    fi
+  done
+  jq_projection+='})'
+fi
+
+# Apply sorting
+jq_sort='.'
+if [[ -n "$sort_field" ]]; then
+  if [[ "$sort_order" == "desc" ]]; then
+    jq_sort="sort_by(.${sort_field}) | reverse"
+  else
+    jq_sort="sort_by(.${sort_field})"
+  fi
+fi
+
+# Apply skip and limit
+jq_slice='.'
+if [[ -n "$skip" ]] && [[ -n "$limit" ]]; then
+  jq_slice=".[${skip}:${skip}+${limit}]"
+elif [[ -n "$skip" ]]; then
+  jq_slice=".[${skip}:]"
+elif [[ -n "$limit" ]]; then
+  jq_slice=".[:${limit}]"
+fi
+
+# Build merged data expression
+jq_merged_data="(${filtered_pipeline} | ${jq_projection} | ${jq_sort} | ${jq_slice})"
+
+# Build aggregations
 jq_aggs='{}'
 if ((${#agg_specs[@]} > 0 || ${#hist_fields[@]} > 0)); then
-  jq_aggs='{'  # we'll build something like {amount_sum: (...), fee_min: (...), bank_code_counts: {...}}
+  jq_aggs='{'
   first=1
 
-  # Numeric / boolean aggregations
+  # Numeric/boolean aggregations
   for spec in "${agg_specs[@]}"; do
     field_name="${spec%%=*}"
     op="${spec##*=}"
+
     case "$op" in
       sum)
-        agg_expr="(${filtered_pipeline} | map(.${field_name}) | add)"
+        agg_expr="(${filtered_pipeline} | map(.${field_name} // 0) | add // 0)"
         agg_key="${field_name}_sum"
         ;;
       count)
@@ -184,16 +501,25 @@ if ((${#agg_specs[@]} > 0 || ${#hist_fields[@]} > 0)); then
         agg_key="${field_name}_count"
         ;;
       min)
-        agg_expr="(${filtered_pipeline} | map(.${field_name}) | min)"
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | map(select(. != null)) | min)"
         agg_key="${field_name}_min"
         ;;
       max)
-        agg_expr="(${filtered_pipeline} | map(.${field_name}) | max)"
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | map(select(. != null)) | max)"
         agg_key="${field_name}_max"
         ;;
       avg)
-        agg_expr="(${filtered_pipeline} | (if length == 0 then null else (map(.${field_name}) | add / length) end))"
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | map(select(. != null)) | if length == 0 then null else (add / length) end)"
         agg_key="${field_name}_avg"
+        ;;
+      median)
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | map(select(. != null)) | sort | if length == 0 then null elif length % 2 == 1 then .[length/2|floor] else (.[length/2-1] + .[length/2]) / 2 end)"
+        agg_key="${field_name}_median"
+        ;;
+      stddev)
+        # Standard deviation calculation
+        agg_expr="(${filtered_pipeline} | map(.${field_name}) | map(select(. != null)) | if length < 2 then null else (. as \$data | (add / length) as \$mean | map(pow(. - \$mean; 2)) | add / length | sqrt) end)"
+        agg_key="${field_name}_stddev"
         ;;
       true_count)
         agg_expr="(${filtered_pipeline} | map(select(.${field_name} == true)) | length)"
@@ -212,10 +538,11 @@ if ((${#agg_specs[@]} > 0 || ${#hist_fields[@]} > 0)); then
         agg_key="${field_name}_false_rate"
         ;;
       *)
-        echo "Unsupported aggregator op '$op' for '$field_name'. Supported: sum,count,min,max,avg,true_count,false_count,true_rate,false_rate" >&2
+        log_error "Unsupported aggregator op '$op'"
         exit 1
         ;;
     esac
+
     if (( first )); then
       jq_aggs+="\"${agg_key}\": ${agg_expr}"
       first=0
@@ -224,25 +551,24 @@ if ((${#agg_specs[@]} > 0 || ${#hist_fields[@]} > 0)); then
     fi
   done
 
-  # Histograms for specified fields
+  # Histograms
   for field_name in "${hist_fields[@]}"; do
-    hist_expr="(${filtered_pipeline} | group_by(.${field_name}) | map({(.[0].${field_name}): length}) | add)"
+    # Handle nulls explicitly, convert all keys to strings for consistency
+    hist_expr="(${filtered_pipeline} | group_by(.${field_name}) | map({(if .[0].${field_name} == null then \"null\" else (.[0].${field_name} | tostring) end): length}) | add // {})"
     agg_key="${field_name}_counts"
+
     if (( first )); then
       jq_aggs+="\"${agg_key}\": ${hist_expr}"
       first=0
     else
-      jq_aggs+="; \"${agg_key}\": ${hist_expr}"
+      jq_aggs+=", \"${agg_key}\": ${hist_expr}"
     fi
   done
 
   jq_aggs+='}'
 fi
 
-# Build merged data expression
-jq_merged_data="(${filtered_pipeline} | ${jq_projection})"
-
-# Final jq program: choose output structure based on output_mode
+# Final jq program based on output mode
 case "$output_mode" in
   merged)
     jq_filter="{result: ${jq_merged_data}}"
@@ -253,9 +579,89 @@ case "$output_mode" in
   both)
     jq_filter="{result: ${jq_merged_data}, aggregates: ${jq_aggs}}"
     ;;
- esac
+esac
 
-# Merge and optionally project selected fields / apply boolean filters / aggregations
-jq -s "$jq_filter" "${files[@]}" > "$output"
+# Add metadata
+jq_filter="{metadata: {files_processed: $(echo "${#files[@]}"), timestamp: (now | strftime(\"%Y-%m-%dT%H:%M:%SZ\")), root_path: \"${root_path}\", output_mode: \"${output_mode}\"}, data: (${jq_filter})}"
 
-echo "Merged ${#files[@]} files into $output"
+if [[ "$verbose" == true ]]; then
+  log_info "Generated jq filter:"
+  echo "$jq_filter" >&2
+fi
+
+if [[ "$dry_run" == true ]]; then
+  log_info "Dry run mode - showing generated filter and exiting"
+  echo ""
+  echo "JQ Filter:"
+  echo "=========="
+  echo "$jq_filter"
+  echo ""
+  echo "Would process files: ${files[*]}"
+  exit 0
+fi
+
+# ============================================================================
+# Execute jq Pipeline
+# ============================================================================
+
+jq_args=(-s)
+if [[ "$pretty" == true ]]; then
+  jq_args+=(-C)
+fi
+
+if [[ "$streaming" == true ]]; then
+  log_info "Using streaming mode..."
+  # Streaming: process one file at a time, then merge
+  temp_merged=$(mktemp)
+  trap 'rm -f "$temp_merged"' EXIT
+
+  jq -n "[]" > "$temp_merged"
+
+  for file in "${files[@]}"; do
+    if [[ "$verbose" == true ]]; then
+      log_info "Processing: $file"
+    fi
+    jq "${root_path}" "$file" | jq -s ". as \$new | input as \$existing | \$existing + \$new" "$temp_merged" - > "${temp_merged}.tmp"
+    mv "${temp_merged}.tmp" "$temp_merged"
+  done
+
+  # Apply final filter to merged data
+  jq "$jq_filter" <(echo "[$(cat "$temp_merged")]") > "$output"
+else
+  # Standard mode: slurp all files at once
+  if [[ "$verbose" == true ]]; then
+    log_info "Processing all files..."
+  fi
+
+  if [[ "$pretty" == true ]]; then
+    jq "${jq_args[@]}" "$jq_filter" "${files[@]}" | jq '.' > "$output"
+  else
+    jq "${jq_args[@]}" "$jq_filter" "${files[@]}" > "$output"
+  fi
+fi
+
+# ============================================================================
+# Summary and Statistics
+# ============================================================================
+
+output_size=$(du -h "$output" | cut -f1)
+record_count=$(jq -r '.data.result // [] | length' "$output" 2>/dev/null || echo "N/A")
+
+log_success "Merged ${#files[@]} files into $output"
+log_info "Output size: $output_size"
+if [[ "$output_mode" != "agg" ]]; then
+  log_info "Total records: $record_count"
+fi
+
+if [[ "$verbose" == true ]]; then
+  log_info "Summary:"
+  jq -C '.metadata' "$output" 2>/dev/null || true
+
+  if [[ "$output_mode" == "agg" || "$output_mode" == "both" ]]; then
+    echo ""
+    log_info "Aggregations:"
+    jq -C '.data.aggregates' "$output" 2>/dev/null || true
+  fi
+fi
+
+exit 0
